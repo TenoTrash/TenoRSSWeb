@@ -1,0 +1,107 @@
+# TenoRSSWeb
+
+Lector de RSS/Atom que genera una web para leer las noticias desde el navegador.
+
+Versión web de [TenoRSS](https://github.com/). Solo Python 3, sin dependencias
+externas (todo con la biblioteca estándar).
+
+## Uso
+
+```bash
+python3 TenoRSSWeb.py
+```
+
+Descarga las fuentes de `rss.txt` y sirve la web en <http://localhost:8080>
+(Ctrl+C para salir).
+
+Opciones:
+
+| Opción | Qué hace |
+|---|---|
+| `--port 9000` | Usar otro puerto (por defecto 8080). |
+| `--update` | Solo descargar y actualizar `cache.json`, sin servir. |
+| `--build index.html` | Generar un HTML estático y salir. |
+| `--no-update` | Arrancar el servidor sin descargar al inicio. |
+
+En la web: el botón **Actualizar** vuelve a bajar los feeds, se puede marcar un
+ítem (o una fuente entera) como leído, y el estado queda guardado en
+`cache.json`. El tema claro/oscuro sigue al del sistema.
+
+## Fuentes: `rss.txt`
+
+Una sección por feed. `TZ` ajusta la hora mostrada: `"auto"` (hora local del
+equipo) o un número de horas respecto de UTC, por ejemplo `"-3"`.
+
+```ini
+TZ="auto"
+
+[Xataka]
+URL="https://www.xataka.com/index.xml"
+
+[Hacker News]
+URL="https://hnrss.org/frontpage"
+```
+
+Las líneas que empiezan con `#` son comentarios.
+
+## Cache: `cache.json`
+
+Guarda hasta 50 ítems por fuente, con el estado leído/no leído. Se crea y se
+reescribe solo, así que no hace falta tocarlo (ni versionarlo). Si se borra, se
+regenera en la próxima actualización.
+
+Formato (JSON válido, un ítem por línea):
+
+```json
+{"app":"TenoRSSWeb","version":1,"saved":<epoch>,"tz_offset":<seg>,"feeds":[
+{"name":"...","url":"...","updated":<epoch>,"status":"ok","items":[
+{"id":"a1b2c3d4","read":0,"date":<epoch>,"title":"...","link":"...","text":"..."}
+]}
+]}
+```
+
+## Qué entiende
+
+- RSS 2.0, RSS 1.0 (RDF) y Atom, con o sin namespaces.
+- Prefiere `content:encoded` / `content` sobre `description` (el texto más completo).
+- Guarda el contenido como **HTML saneado** (lista blanca de etiquetas: párrafos,
+  negritas, listas, enlaces, imágenes…; se descartan `script`, `style`, `iframe`,
+  atributos de eventos, `javascript:`, etc.). Los enlaces abren en pestaña nueva.
+- Recorta el contenido a `TEXT_LIMIT` caracteres visibles (por defecto 3000),
+  cerrando bien las etiquetas abiertas.
+- Ordena los ítems del más nuevo al más viejo cuando todos traen fecha.
+- Conserva el estado de leído al actualizar.
+- Si una fuente falla, deja sus ítems anteriores y muestra el error sin afectar
+  al resto.
+
+En la web cada ítem muestra solo el título; al hacer clic se despliega el
+contenido y un enlace al artículo original.
+
+## Lectura offline
+
+Al actualizar, las imágenes de cada noticia (las del cuerpo y la destacada de
+Media RSS: `media:content` / `media:thumbnail` / `enclosure` de tipo imagen) se
+descargan a la carpeta `media/` y se reescriben a rutas locales (`/media/…`).
+Así, una vez actualizado, el lector funciona sin conexión: el HTML, el CSS, el
+JavaScript y las tipografías ya son locales, y ahora también las imágenes.
+
+- Cada imagen se guarda una sola vez (nombre = hash de la URL).
+- No se cachean imágenes de más de 5 MB (`MAX_IMG_BYTES`); quedan como enlace
+  remoto (se ven solo con conexión).
+- Las imágenes que dejan de usarse (ítems que salen del caché o fuentes
+  borradas) se eliminan solas en la siguiente actualización.
+
+Lo único que sigue necesitando conexión es "Abrir enlace original" (es el
+artículo completo en su sitio).
+
+## Estructura
+
+- `TenoRSSWeb.py`: todo el programa (config, descarga, parser, cache, web y servidor).
+- `rss.txt`: las fuentes a leer.
+- `cache.json`: ítems guardados (se regenera solo).
+- `media/`: imágenes cacheadas para lectura offline (se regenera; no se versiona).
+- `backups/`: copias de `rss.txt` previas a cada edición desde `/fuentes`.
+
+## Licencia
+
+MIT. Ver [LICENSE](LICENSE).
