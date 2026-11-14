@@ -22,19 +22,19 @@ Opciones:
 | `--update` | Solo descargar y actualizar `cache.json`, sin servir. |
 | `--build index.html` | Generar un HTML estático y salir. |
 | `--no-update` | Arrancar el servidor sin descargar al inicio. |
+| `--interval 15` | Minutos entre actualizaciones automáticas (por defecto 30; `0` las desactiva). |
 
-En la web: el botón **Actualizar** vuelve a bajar los feeds, se puede marcar un
-ítem (o una fuente entera) como leído, y el estado queda guardado en
-`cache.json`. El tema claro/oscuro sigue al del sistema.
+Mientras el servidor está levantado refresca las fuentes solo cada 30 minutos
+(configurable con `--interval`). Igual el botón **Actualizar** las vuelve a
+bajar en el momento. Se puede marcar un ítem (o una fuente entera) como leído,
+y el estado queda guardado en `cache.json`. El tema claro/oscuro sigue al del
+sistema.
 
 ## Fuentes: `rss.txt`
 
-Una sección por feed. `TZ` ajusta la hora mostrada: `"auto"` (hora local del
-equipo) o un número de horas respecto de UTC, por ejemplo `"-3"`.
+Una sección `[Nombre]` por feed, cada una con su línea `URL="..."`.
 
 ```ini
-TZ="auto"
-
 [Xataka]
 URL="https://www.xataka.com/index.xml"
 
@@ -43,6 +43,9 @@ URL="https://hnrss.org/frontpage"
 ```
 
 Las líneas que empiezan con `#` son comentarios.
+
+No hay nada de zona horaria para configurar: las fechas de cada ítem se
+guardan en UTC y el navegador las muestra en tu hora local.
 
 ## Cache: `cache.json`
 
@@ -53,7 +56,7 @@ regenera en la próxima actualización.
 Formato (JSON válido, un ítem por línea):
 
 ```json
-{"app":"TenoRSSWeb","version":1,"saved":<epoch>,"tz_offset":<seg>,"feeds":[
+{"app":"TenoRSSWeb","version":1,"saved":<epoch>,"feeds":[
 {"name":"...","url":"...","updated":<epoch>,"status":"ok","items":[
 {"id":"a1b2c3d4","read":0,"date":<epoch>,"title":"...","link":"...","text":"..."}
 ]}

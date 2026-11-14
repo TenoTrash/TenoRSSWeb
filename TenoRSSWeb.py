@@ -47,6 +47,7 @@ MAX_ITEMS = 50            # items guardados por fuente
 TEXT_LIMIT = 3000         # maximo de texto visible por item (se recorta el resto)
 MAX_IMG_BYTES = 5 * 1024 * 1024  # imagenes mas grandes no se cachean (se dejan remotas)
 HTTP_TIMEOUT = 15         # segundos por descarga
+AUTO_UPDATE_MINUTES = 30  # cada cuanto refresca solo el servidor (0 = desactivado)
 USER_AGENT = "TenoRSSWeb/1.0 (+https://github.com/ ; RSS reader)"
 
 # Candado para que varias peticiones del navegador no escriban cache.json a la vez.
@@ -57,9 +58,8 @@ _cache_lock = threading.Lock()
 # Configuracion: rss.txt
 # --------------------------------------------------------------------------
 def parse_rss_txt(text):
-    """Devuelve (lista de {'name','url'}, tz) a partir del contenido de rss.txt."""
+    """Devuelve la lista de {'name','url'} a partir del contenido de rss.txt."""
     feeds = []
-    tz = "auto"
     current = None
     for raw in text.splitlines():
         line = raw.strip()
@@ -74,29 +74,16 @@ def parse_rss_txt(text):
             continue
         key = key.strip().upper()
         val = val.strip().strip('"').strip("'").strip()
-        if key == "TZ":
-            tz = val or "auto"
-        elif key == "URL" and current is not None:
+        if key == "URL" and current is not None:
             current["url"] = val
-    return [f for f in feeds if f["url"]], tz
+    return [f for f in feeds if f["url"]]
 
 
 def load_config():
     if not os.path.exists(RSS_FILE):
-        return [], "auto"
+        return []
     with open(RSS_FILE, "r", encoding="utf-8") as fh:
         return parse_rss_txt(fh.read())
-
-
-def tz_offset_seconds(tz):
-    """tz de rss.txt -> segundos respecto de UTC. 'auto' = hora local del equipo."""
-    if tz == "auto":
-        off = datetime.now(timezone.utc).astimezone().utcoffset()
-        return int(off.total_seconds()) if off else 0
-    try:
-        return int(float(tz) * 3600)
-    except ValueError:
-        return 0
 
 
 def build_rss_txt(feeds):
@@ -144,7 +131,7 @@ def save_rss_txt(feeds):
 def sync_cache_to_config():
     """Ajusta cache.json a las fuentes de rss.txt sin descargar: saca las que ya
     no estan, agrega las nuevas vacias y mantiene los items de las que siguen."""
-    feeds_cfg, tz = load_config()
+    feeds_cfg = load_config()
     with _cache_lock:
         cache = load_cache()
         old = {f.get("url"): f for f in cache.get("feeds", [])}
@@ -158,7 +145,6 @@ def sync_cache_to_config():
                 new.append({"name": cfg["name"], "url": cfg["url"],
                             "status": "sin actualizar", "updated": 0, "items": []})
         cache["feeds"] = new
-        cache["tz_offset"] = tz_offset_seconds(tz)
         cache["dirty"] = True   # fuentes editadas: hay que actualizar
         prune_media(cache)      # imagenes de fuentes borradas quedan huerfanas
         save_cache(cache)
@@ -170,17 +156,14 @@ def sync_cache_to_config():
 # --------------------------------------------------------------------------
 def load_cache():
     if not os.path.exists(CACHE_FILE):
-        return {"app": APP_NAME, "version": CACHE_VERSION, "saved": 0,
-                "tz_offset": 0, "feeds": []}
+        return {"app": APP_NAME, "version": CACHE_VERSION, "saved": 0, "feeds": []}
     try:
         with open(CACHE_FILE, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
-        return {"app": APP_NAME, "version": CACHE_VERSION, "saved": 0,
-                "tz_offset": 0, "feeds": []}
+        return {"app": APP_NAME, "version": CACHE_VERSION, "saved": 0, "feeds": []}
     if not isinstance(data, dict) or not isinstance(data.get("feeds"), list):
-        return {"app": APP_NAME, "version": CACHE_VERSION, "saved": 0,
-                "tz_offset": 0, "feeds": []}
+        return {"app": APP_NAME, "version": CACHE_VERSION, "saved": 0, "feeds": []}
     return data
 
 
@@ -197,10 +180,9 @@ def save_cache(cache):
 def dump_cache(cache):
     """JSON legible: un item por linea (como el TenoRSS original)."""
     out = []
-    out.append('{"app":%s,"version":%d,"saved":%d,"tz_offset":%d,"dirty":%d,"feeds":[' % (
+    out.append('{"app":%s,"version":%d,"saved":%d,"dirty":%d,"feeds":[' % (
         json.dumps(cache.get("app", APP_NAME)), int(cache.get("version", CACHE_VERSION)),
-        int(cache.get("saved", 0)), int(cache.get("tz_offset", 0)),
-        1 if cache.get("dirty") else 0))
+        int(cache.get("saved", 0)), 1 if cache.get("dirty") else 0))
     feed_chunks = []
     for feed in cache.get("feeds", []):
         head = '\n{"name":%s,"url":%s,"updated":%d,"status":%s,"items":[' % (
@@ -618,7 +600,7 @@ def merge_items(fresh, old):
 
 def update_all(verbose=True):
     """Descarga todas las fuentes y reescribe cache.json. Devuelve el cache."""
-    feeds_cfg, tz = load_config()
+    feeds_cfg = load_config()
     with _cache_lock:
         cache = load_cache()
         old_by_url = {f.get("url"): f for f in cache.get("feeds", [])}
@@ -647,7 +629,6 @@ def update_all(verbose=True):
                 "updated": updated, "items": items,
             })
         cache["feeds"] = new_feeds
-        cache["tz_offset"] = tz_offset_seconds(tz)
         cache["dirty"] = False  # recien actualizado
         prune_media(cache)      # borra imagenes que ya no usa ningun item
         save_cache(cache)
@@ -686,11 +667,19 @@ def set_read_feed(feed_url, read):
 # --------------------------------------------------------------------------
 # Generacion de la web
 # --------------------------------------------------------------------------
-def human_time(epoch, tz_offset):
+def fmt_utc(epoch):
+    """epoch -> 'dd/mm/YYYY HH:MM' en UTC (respaldo si el navegador no corre JS)."""
     if not epoch:
         return ""
-    dt = datetime.fromtimestamp(epoch + tz_offset, timezone.utc)
-    return dt.strftime("%d/%m/%Y %H:%M")
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%d/%m/%Y %H:%M")
+
+
+def date_el(epoch, cls="date"):
+    """<time> con el epoch; el navegador lo muestra en su hora local (ver DATE_JS).
+    Sin JS queda el respaldo en UTC."""
+    if not epoch:
+        return ""
+    return '<time class="%s" data-ts="%d">%s</time>' % (cls, int(epoch), fmt_utc(epoch))
 
 
 def e(s):
@@ -876,13 +865,29 @@ document.addEventListener('DOMContentLoaded', function(){
 });
 """
 
+DATE_JS = """
+// Fechas: el servidor las manda como epoch UTC (data-ts) y cada navegador las
+// muestra en su propia hora local. Sin JS queda el respaldo en UTC del HTML.
+function fmtDates(root){
+  var p = function(n){ return (n<10?'0':'')+n; };
+  (root||document).querySelectorAll('[data-ts]').forEach(function(el){
+    var ts = parseInt(el.getAttribute('data-ts'), 10);
+    if(!ts) return;
+    var d = new Date(ts*1000);
+    el.textContent = p(d.getDate())+'/'+p(d.getMonth()+1)+'/'+d.getFullYear()
+      +' '+p(d.getHours())+':'+p(d.getMinutes());
+  });
+}
+document.addEventListener('DOMContentLoaded', function(){ fmtDates(); });
+"""
+
 # Script minimo en <head>: el default es oscuro (data-theme='dark' en <html>);
 # solo lo cambia si hay una eleccion guardada. Corre antes de pintar (sin parpadeo).
 THEME_INIT = ("<script>try{var t=localStorage.getItem('tenorss-theme');"
               "if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>")
 
 
-def render_feed_html(feed, tz_offset, index=0, static=False):
+def render_feed_html(feed, index=0, static=False):
     items = feed.get("items", [])
     unread = sum(1 for it in items if not it.get("read"))
     parts = []
@@ -905,8 +910,7 @@ def render_feed_html(feed, tz_offset, index=0, static=False):
         cls = "item read" if it.get("read") else "item"
         parts.append('<details class="%s" data-id="%s">' % (cls, e(it.get("id", ""))))
         # Colapsado: solo el titulo (y la fecha). Clic en el titulo -> expande.
-        dt = human_time(it.get("date", 0), tz_offset)
-        date_html = ('<span class="date">%s</span>' % e(dt)) if dt else ""
+        date_html = date_el(it.get("date", 0))
         parts.append('<summary class="top"><span class="caret">&#9656;</span>'
                      '<span class="title">%s</span>%s</summary>'
                      % (e(it.get("title", "")), date_html))
@@ -934,12 +938,11 @@ def render_feed_html(feed, tz_offset, index=0, static=False):
 
 
 def render_page(cache, static=False):
-    tz_offset = int(cache.get("tz_offset", 0))
     feeds = cache.get("feeds", [])
     total = sum(len(f.get("items", [])) for f in feeds)
     unread = sum(1 for f in feeds for it in f.get("items", []) if not it.get("read"))
     saved = cache.get("saved", 0)
-    saved_txt = human_time(saved, tz_offset) if saved else "nunca"
+    saved_html = date_el(saved) if saved else "nunca"
 
     html_parts = []
     html_parts.append("<!doctype html><html lang='es' data-theme='dark'><head><meta charset='utf-8'>")
@@ -953,7 +956,7 @@ def render_page(cache, static=False):
     html_parts.append("<header><h1>Teno<span class='dot'>&bull;</span>RSS <span style='color:var(--muted);font-weight:400;font-size:13px'>Web</span></h1>")
     html_parts.append("<span class='meta'>%d sin leer / %d items</span>" % (unread, total))
     html_parts.append("<span class='spacer'></span>")
-    html_parts.append("<span class='meta'>actualizado: %s</span>" % e(saved_txt))
+    html_parts.append("<span class='meta'>actualizado: %s</span>" % saved_html)
     if not static:
         dirty = bool(cache.get("dirty"))
         btn_cls = " class='needs-refresh'" if dirty else ""
@@ -995,12 +998,13 @@ def render_page(cache, static=False):
     if not feeds:
         html_parts.append("<div class='empty'>No hay fuentes. Agregalas en <code>rss.txt</code> y actualiza.</div>")
     for i, feed in enumerate(feeds):
-        html_parts.append(render_feed_html(feed, tz_offset, index=i, static=static))
+        html_parts.append(render_feed_html(feed, index=i, static=static))
     html_parts.append("</main>")
 
     html_parts.append("</div>")  # layout
 
     html_parts.append("<footer>%s &middot; lector de RSS</footer>" % APP_NAME)
+    html_parts.append("<script>%s</script>" % DATE_JS)  # fechas en hora local del navegador
     if not static:
         html_parts.append("<script>%s</script>" % PAGE_JS)
     html_parts.append("</body></html>")
@@ -1010,8 +1014,6 @@ def render_page(cache, static=False):
 ADMIN_CSS = """
 .admin{max-width:760px;margin:0 auto;padding:18px 16px 40px}
 .admin .intro{color:var(--muted);font-size:14px;margin:0 0 18px}
-.admin .tz{display:flex;align-items:center;gap:10px;margin:0 0 16px;font-size:14px}
-.admin .tz input{width:120px}
 .admin input{font:inherit;background:var(--panel);color:var(--fg);
   border:1px solid var(--line);border-radius:8px;padding:8px 10px}
 .admin input:focus{outline:none;border-color:var(--accent)}
@@ -1068,7 +1070,7 @@ document.addEventListener('DOMContentLoaded', updateThemeBtn);
 
 
 def render_admin_page(saved_backup=None):
-    feeds_cfg, _tz = load_config()
+    feeds_cfg = load_config()
     p = []
     p.append("<!doctype html><html lang='es' data-theme='dark'><head><meta charset='utf-8'>")
     p.append("<meta name='viewport' content='width=device-width,initial-scale=1'>")
@@ -1228,15 +1230,33 @@ class Handler(BaseHTTPRequestHandler):
             self._send("404", status=404, ctype="text/plain")
 
 
-def serve(port, do_update=True):
+def _auto_update_loop(interval_seconds, stop_event):
+    """Refresca todas las fuentes cada interval_seconds hasta que se pide parar."""
+    while not stop_event.wait(interval_seconds):
+        try:
+            update_all(verbose=False)
+            print("  [auto] feeds actualizados (%s)" % time.strftime("%H:%M:%S"))
+        except Exception as exc:  # que un fallo de red no corte el timer
+            sys.stderr.write("  [auto] fallo la actualizacion: %s\n" % exc)
+
+
+def serve(port, do_update=True, interval_minutes=AUTO_UPDATE_MINUTES):
     if do_update:
-        feeds_cfg, _ = load_config()
+        feeds_cfg = load_config()
         if feeds_cfg:
             print("Actualizando %d fuentes..." % len(feeds_cfg))
             try:
                 update_all(verbose=True)
             except Exception as exc:
                 print("  (aviso) fallo la actualizacion inicial: %s" % exc)
+
+    stop_event = threading.Event()
+    if interval_minutes and interval_minutes > 0:
+        threading.Thread(target=_auto_update_loop,
+                         args=(interval_minutes * 60, stop_event),
+                         daemon=True).start()
+        print("Actualizacion automatica cada %d min." % interval_minutes)
+
     httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print("\n%s en http://localhost:%d  (Ctrl+C para salir)" % (APP_NAME, port))
     try:
@@ -1244,6 +1264,7 @@ def serve(port, do_update=True):
     except KeyboardInterrupt:
         print("\nChau.")
     finally:
+        stop_event.set()
         httpd.server_close()
 
 
@@ -1256,6 +1277,8 @@ def main(argv=None):
     ap.add_argument("--update", action="store_true", help="solo descargar y actualizar cache.json")
     ap.add_argument("--build", metavar="ARCHIVO", help="generar un HTML estatico y salir")
     ap.add_argument("--no-update", action="store_true", help="no actualizar al arrancar el servidor")
+    ap.add_argument("--interval", type=int, default=AUTO_UPDATE_MINUTES,
+                    help="minutos entre actualizaciones automaticas (0 = desactivar; def. %d)" % AUTO_UPDATE_MINUTES)
     args = ap.parse_args(argv)
 
     if args.update:
@@ -1272,7 +1295,7 @@ def main(argv=None):
         print("HTML generado en %s" % args.build)
         return 0
 
-    serve(args.port, do_update=not args.no_update)
+    serve(args.port, do_update=not args.no_update, interval_minutes=args.interval)
     return 0
 
 
