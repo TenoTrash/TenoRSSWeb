@@ -27,8 +27,17 @@ Opciones:
 Mientras el servidor está levantado refresca las fuentes solo cada 30 minutos
 (configurable con `--interval`). Igual el botón **Actualizar** las vuelve a
 bajar en el momento. Se puede marcar un ítem (o una fuente entera) como leído,
-y el estado queda guardado en `cache.json`. El tema claro/oscuro sigue al del
-sistema.
+y el estado queda guardado en `cache.json`. Arranca en **vista de mosaico**
+(grilla de tarjetas con la imagen del ítem como miniatura; los que no traen
+imagen muestran solo título y fecha) y un botón del encabezado la alterna con
+la **vista de lista**; al abrir una tarjeta se expande a todo el ancho con el
+contenido.
+La vista elegida y el tema claro/oscuro se recuerdan en el navegador (el tema
+sigue al del sistema por defecto).
+
+Cada ítem tiene también un botón **Guardar**: archiva esa noticia en
+`saved.json` y aparece en la vista **★ Guardados** de la barra lateral. Ver
+["Guardados"](#guardados-bookmarks-savedjson) más abajo.
 
 ## Fuentes: `rss.txt`
 
@@ -60,6 +69,30 @@ Formato (JSON válido, un ítem por línea):
 {"name":"...","url":"...","updated":<epoch>,"status":"ok","items":[
 {"id":"a1b2c3d4","read":0,"date":<epoch>,"title":"...","link":"...","text":"..."}
 ]}
+]}
+```
+
+## Guardados (bookmarks): `saved.json`
+
+El botón **Guardar** de cada ítem archiva esa noticia en `saved.json` y la
+muestra en la vista **★ Guardados** de la barra lateral. A diferencia de
+`cache.json`, este archivo **no se poda ni se regenera**: guarda una copia
+(*snapshot*) del ítem al momento de guardarlo, así la noticia no se pierde
+aunque envejezca y salga del caché, o aunque borres la fuente.
+
+- La copia conserva título, enlace, contenido, fecha, la **fuente de origen** y
+  cuándo se guardó.
+- Las imágenes de lo guardado también quedan en `media/` (la limpieza las
+  respeta), así se ven offline.
+- Es **data personal**: está en `.gitignore` (no va al repo ni al zip) y, como
+  no se regenera sola, **conviene respaldarla**. Para quitar un guardado, usá
+  el mismo botón (**Guardada ★**) en la noticia.
+
+Formato (igual que `cache.json`, un ítem por línea):
+
+```json
+{"app":"TenoRSSWeb","version":1,"items":[
+{"id":"a1b2c3d4","date":<epoch>,"saved_ts":<epoch>,"feed":"...","title":"...","link":"...","text":"..."}
 ]}
 ```
 
@@ -101,7 +134,9 @@ artículo completo en su sitio).
 
 - `TenoRSSWeb.py`: todo el programa (config, descarga, parser, cache, web y servidor).
 - `rss.txt`: las fuentes a leer.
-- `cache.json`: ítems guardados (se regenera solo).
+- `cache.json`: ítems de cada fuente (se regenera solo).
+- `saved.json`: noticias guardadas (bookmarks); data personal, no se versiona
+  ni se regenera (respaldala).
 - `media/`: imágenes cacheadas para lectura offline (se regenera; no se versiona).
 - `backups/`: copias de `rss.txt` previas a cada edición desde `/fuentes`.
 

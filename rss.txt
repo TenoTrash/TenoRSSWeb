@@ -37,3 +37,6 @@ URL="https://www.brodersendarknews.com/feed"
 
 [CVE High/Critical]
 URL="https://cvefeed.io/rssfeed/severity/high.xml"
+
+[Infobae]
+URL="https://www.infobae.com/arc/outboundfeeds/rss/"

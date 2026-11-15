@@ -38,6 +38,7 @@ from xml.etree import ElementTree as ET
 HERE = os.path.dirname(os.path.abspath(__file__))
 RSS_FILE = os.path.join(HERE, "rss.txt")
 CACHE_FILE = os.path.join(HERE, "cache.json")
+SAVED_FILE = os.path.join(HERE, "saved.json")  # bookmarks: copias que NO se podan
 BACKUP_DIR = os.path.join(HERE, "backups")  # copias de rss.txt antes de cada edicion
 MEDIA_DIR = os.path.join(HERE, "media")      # imagenes cacheadas para leer offline
 
@@ -52,6 +53,7 @@ USER_AGENT = "TenoRSSWeb/1.0 (+https://github.com/ ; RSS reader)"
 
 # Candado para que varias peticiones del navegador no escriban cache.json a la vez.
 _cache_lock = threading.Lock()
+_saved_lock = threading.Lock()  # idem para saved.json (bookmarks)
 
 
 # --------------------------------------------------------------------------
@@ -204,6 +206,105 @@ def dump_cache(cache):
     out.append(",".join(feed_chunks))
     out.append("\n]}\n")
     return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# Guardados (bookmarks): saved.json
+# --------------------------------------------------------------------------
+# A diferencia de cache.json, saved.json NO se poda ni se regenera: guarda una
+# copia (snapshot) del item al momento de marcarlo, para no perder la noticia
+# aunque envejezca y salga del cache o se borre la fuente.
+def load_saved():
+    if not os.path.exists(SAVED_FILE):
+        return {"app": APP_NAME, "version": CACHE_VERSION, "items": []}
+    try:
+        with open(SAVED_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {"app": APP_NAME, "version": CACHE_VERSION, "items": []}
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return {"app": APP_NAME, "version": CACHE_VERSION, "items": []}
+    return data
+
+
+def dump_saved(data):
+    """JSON legible: un item guardado por linea (como cache.json)."""
+    out = ['{"app":%s,"version":%d,"items":[' % (
+        json.dumps(data.get("app", APP_NAME)), int(data.get("version", CACHE_VERSION)))]
+    lines = []
+    for it in data.get("items", []):
+        lines.append('\n' + json.dumps({
+            "id": it.get("id", ""),
+            "date": int(it.get("date", 0)),
+            "saved_ts": int(it.get("saved_ts", 0)),
+            "feed": it.get("feed", ""),
+            "title": it.get("title", ""),
+            "link": it.get("link", ""),
+            "text": it.get("text", ""),
+        }, ensure_ascii=False))
+    out.append(",".join(lines))
+    out.append("\n]}\n")
+    return "".join(out)
+
+
+def save_saved(data):
+    data["app"] = APP_NAME
+    data["version"] = CACHE_VERSION
+    tmp = SAVED_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(dump_saved(data))
+    os.replace(tmp, SAVED_FILE)
+
+
+def saved_ids():
+    """Set de ids guardados, para marcar el boton 'Guardar' al renderizar."""
+    return {it.get("id") for it in load_saved().get("items", []) if it.get("id")}
+
+
+def save_item(item_hash):
+    """Copia a saved.json el item (lo busca en cache.json). True si quedo guardado."""
+    if not item_hash:
+        return False
+    cache = load_cache()
+    found, feedname = None, ""
+    for feed in cache.get("feeds", []):
+        for it in feed.get("items", []):
+            if it.get("id") == item_hash:
+                found, feedname = it, feed.get("name", "")
+                break
+        if found:
+            break
+    if not found:
+        return False
+    with _saved_lock:
+        data = load_saved()
+        items = data.get("items", [])
+        if any(s.get("id") == item_hash for s in items):
+            return True  # ya estaba guardado
+        items.insert(0, {  # mas reciente primero
+            "id": found.get("id", ""),
+            "date": int(found.get("date", 0)),
+            "saved_ts": int(time.time()),
+            "feed": feedname,
+            "title": found.get("title", ""),
+            "link": found.get("link", ""),
+            "text": found.get("text", ""),
+        })
+        data["items"] = items
+        save_saved(data)
+    return True
+
+
+def unsave_item(item_hash):
+    """Quita un item de saved.json. Idempotente (True aunque no estuviera)."""
+    with _saved_lock:
+        data = load_saved()
+        items = data.get("items", [])
+        kept = [s for s in items if s.get("id") != item_hash]
+        if len(kept) != len(items):
+            data["items"] = kept
+            save_saved(data)
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -563,12 +664,13 @@ def prune_media(cache):
     if not os.path.isdir(MEDIA_DIR):
         return
     used = set()
-    for feed in cache.get("feeds", []):
-        for it in feed.get("items", []):
-            for m in _IMG_SRC_RE.finditer(it.get("text", "")):
-                src = m.group(2)
-                if src.startswith("/media/"):
-                    used.add(src[len("/media/"):])
+    items = [it for feed in cache.get("feeds", []) for it in feed.get("items", [])]
+    items += load_saved().get("items", [])   # las de lo guardado tampoco se borran
+    for it in items:
+        for m in _IMG_SRC_RE.finditer(it.get("text", "")):
+            src = m.group(2)
+            if src.startswith("/media/"):
+                used.add(src[len("/media/"):])
     for f in os.listdir(MEDIA_DIR):
         if f.endswith(".tmp") or f not in used:
             try:
@@ -706,16 +808,19 @@ PAGE_CSS = """
 body{margin:0;background:var(--bg);color:var(--fg);
   font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 header{position:sticky;top:0;z-index:10;background:var(--panel);
-  border-bottom:1px solid var(--line);padding:12px 16px;
+  border-bottom:1px solid var(--line);padding:2px 16px;
   display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-header h1{font-size:18px;margin:0;letter-spacing:.5px}
+header h1{font-size:32px;margin:0;letter-spacing:.3px;line-height:1;white-space:nowrap}
 header h1 .dot{color:var(--accent)}
+header h1 .web{font-size:.66em;font-weight:400;color:var(--muted)}
 header .spacer{flex:1}
 header .meta{color:var(--muted);font-size:13px}
+header .meta.count{flex:1;text-align:center}
 button,.btn{font:inherit;cursor:pointer;border:1px solid var(--line);
-  background:var(--panel2);color:var(--fg);padding:6px 12px;border-radius:8px}
+  background:var(--panel2);color:var(--fg);padding:4px 10px;border-radius:8px}
+header button{line-height:1}  /* iguala el alto del boton Actualizar al de los iconos */
 button:hover,.btn:hover{border-color:var(--accent)}
-#themeBtn{min-width:40px;line-height:1}
+#themeBtn,#viewBtn{min-width:40px;line-height:1}
 button.needs-refresh{background:#e5484d;border-color:#e5484d;color:#fff;font-weight:600;
   animation:pulseRed 1.4s ease-in-out infinite}
 button.needs-refresh:hover{background:#d13b40;border-color:#d13b40}
@@ -726,7 +831,8 @@ button.needs-refresh:hover{background:#d13b40;border-color:#d13b40}
 /* Layout: barra lateral + contenido */
 .layout{display:flex;align-items:flex-start;max-width:1150px;margin:0 auto;gap:0}
 .sidebar{flex:0 0 240px;width:240px;position:sticky;top:57px;align-self:flex-start;
-  max-height:calc(100vh - 57px);overflow:auto;padding:16px 10px 16px 16px}
+  max-height:calc(100vh - 57px);overflow:auto;scrollbar-width:none;padding:16px 10px 16px 16px}
+.sidebar::-webkit-scrollbar{display:none}
 .sidebar .side-title{font-size:12px;text-transform:uppercase;letter-spacing:.08em;
   color:var(--muted);margin:4px 8px 8px}
 .sidebar a.side-title-link{display:flex;align-items:center;gap:6px;text-decoration:none;
@@ -791,8 +897,34 @@ main{flex:1;min-width:0;padding:16px}
 .item .acts a.link:hover{opacity:.85}
 .item .acts a.mark-read{color:var(--muted);font-size:12px;text-decoration:none;cursor:pointer}
 .item .acts a.mark-read:hover{color:var(--accent)}
+.item .acts a.save{color:var(--muted);font-size:12px;text-decoration:none;cursor:pointer}
+.item .acts a.save:hover{color:var(--accent2)}
+.item .acts a.save.on{color:var(--accent2)}
+.item .srctag{color:var(--muted);font-size:11px;background:var(--panel2);
+  border-radius:6px;padding:1px 7px;white-space:nowrap}
 .empty{color:var(--muted);text-align:center;padding:40px}
 footer{color:var(--muted);text-align:center;font-size:12px;padding:24px}
+
+/* Vista mosaico: los items de cada feed en una grilla de tarjetas. El item
+   abierto ocupa toda la fila y muestra el cuerpo (mismo <details> que la lista). */
+:root[data-view="mosaic"] .feed{display:grid;gap:10px;
+  grid-template-columns:repeat(auto-fill,minmax(230px,1fr))}
+:root[data-view="mosaic"] .feed > h2{grid-column:1/-1;margin-bottom:0}
+:root[data-view="mosaic"] .feed > .empty{grid-column:1/-1}
+:root[data-view="mosaic"] .item{margin:0;display:flex;flex-direction:column}
+:root[data-view="mosaic"] .item > summary{flex-direction:column;align-items:flex-start;
+  gap:6px;min-height:86px;height:100%}
+:root[data-view="mosaic"] .item:not([open]) > summary .caret{display:none}
+:root[data-view="mosaic"] .item:not([open]) .title{font-size:14px;white-space:normal;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.item .thumb{display:none}
+:root[data-view="mosaic"] .item:not([open]) .thumb{display:block;width:100%;height:132px;
+  object-fit:cover;border-radius:7px;background:var(--panel2);margin-bottom:2px}
+:root[data-view="mosaic"] .item .date{margin-left:0;margin-top:auto}
+:root[data-view="mosaic"] .item[open]{grid-column:1/-1}
+:root[data-view="mosaic"] .item[open] > summary{flex-direction:row;align-items:baseline;
+  min-height:0;height:auto}
+:root[data-view="mosaic"] .item[open] .date{margin-top:0;margin-left:auto}
 
 @media (max-width:720px){
   .layout{flex-direction:column}
@@ -823,12 +955,37 @@ function toggleTheme(){
   applyTheme(next); updateThemeBtn();
 }
 
+// Vista: lista (default) o mosaico; el toggle guarda la eleccion.
+function applyView(v){
+  document.documentElement.setAttribute('data-view', v==='mosaic'?'mosaic':'list');
+}
+function currentView(){
+  return document.documentElement.getAttribute('data-view')==='mosaic' ? 'mosaic':'list';
+}
+function updateViewBtn(){
+  const b = document.getElementById('viewBtn');
+  if(!b) return;
+  const m = currentView()==='mosaic';
+  b.textContent = m ? '\\u2630' : '\\u25A6';           // en mosaico muestra icono de lista
+  b.title = m ? 'Vista lista' : 'Vista mosaico';
+}
+function toggleView(){
+  const next = currentView()==='mosaic' ? 'list':'mosaic';
+  try{ localStorage.setItem('tenorss-view', next); }catch(e){}
+  applyView(next); updateViewBtn();
+}
+
 // Filtro por fuente desde la barra lateral.
 function filterSource(el){
   const url = el.dataset.url || '';
   document.querySelectorAll('.sidebar a.src').forEach(a=>a.classList.toggle('active', a===el));
   document.querySelectorAll('main .feed').forEach(f=>{
-    f.style.display = (!url || f.dataset.url===url) ? '' : 'none';
+    const isSaved = f.dataset.url==='__saved__';
+    let show;
+    if(url==='__saved__') show = isSaved;       // solo la seccion Guardados
+    else if(!url) show = !isSaved;              // "Todas" oculta Guardados
+    else show = (f.dataset.url===url);          // una fuente puntual
+    f.style.display = show ? '' : 'none';
   });
   try{ localStorage.setItem('tenorss-src', url); }catch(e){}
   window.scrollTo(0,0);
@@ -859,9 +1016,30 @@ async function markFeed(a){
   const ok = await post('/api/readfeed?url='+encodeURIComponent(url)+'&read=1');
   if(ok) location.reload();
 }
+// Guardar / quitar bookmark. Actualiza todas las copias del item y el contador.
+async function toggleSave(el){
+  const item = el.closest('.item');
+  const id = item.dataset.id;
+  const isSaved = el.classList.contains('on');
+  const ok = await post('/api/save?id='+encodeURIComponent(id)+'&save='+(isSaved?0:1));
+  if(!ok) return;
+  const nowSaved = !isSaved;
+  document.querySelectorAll('.item[data-id="'+CSS.escape(id)+'"]').forEach(function(it){
+    const inSaved = it.closest('.feed[data-url="__saved__"]');
+    if(inSaved && !nowSaved){ it.remove(); return; }   // se quito desde Guardados
+    const a = it.querySelector('a.save');
+    if(a){
+      a.classList.toggle('on', nowSaved);
+      a.innerHTML = nowSaved ? 'Guardada \\u2605' : 'Guardar \\u2606';
+      a.title = nowSaved ? 'Quitar de guardados' : 'Guardar la noticia';
+    }
+  });
+  const c = document.querySelector('.sidebar a.src[data-url="__saved__"] .c');
+  if(c){ c.textContent = Math.max(0, (parseInt(c.textContent,10)||0) + (nowSaved?1:-1)); }
+}
 
 document.addEventListener('DOMContentLoaded', function(){
-  updateThemeBtn(); restoreSource();
+  updateThemeBtn(); updateViewBtn(); restoreSource();
 });
 """
 
@@ -884,10 +1062,58 @@ document.addEventListener('DOMContentLoaded', function(){ fmtDates(); });
 # Script minimo en <head>: el default es oscuro (data-theme='dark' en <html>);
 # solo lo cambia si hay una eleccion guardada. Corre antes de pintar (sin parpadeo).
 THEME_INIT = ("<script>try{var t=localStorage.getItem('tenorss-theme');"
-              "if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);}catch(e){}</script>")
+              "if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t);"
+              "var v=localStorage.getItem('tenorss-view');"
+              "if(v==='mosaic'||v==='list')document.documentElement.setAttribute('data-view',v);"
+              "}catch(e){}</script>")
 
 
-def render_feed_html(feed, index=0, static=False):
+def _render_item(it, static=False, is_saved=False, saved_mode=False, source=""):
+    """Un <details> de item (sirve para feeds y para la seccion Guardados).
+    is_saved: ya esta en saved.json.  saved_mode: se renderiza dentro de Guardados
+    (sin 'marcar leido', con la fuente de origen)."""
+    parts = []
+    cls = "item read" if (it.get("read") and not saved_mode) else "item"
+    parts.append('<details class="%s" data-id="%s">' % (cls, e(it.get("id", ""))))
+    # Colapsado: titulo y fecha (y, solo en vista mosaico, una miniatura).
+    date_html = date_el(it.get("date", 0))
+    # Primera imagen del contenido (ya saneada y, si se cacheo, local /media/).
+    m = _IMG_SRC_RE.search(it.get("text", ""))
+    # src ya viene escapado para atributo desde sanitize_html; si falla, se quita.
+    thumb_html = ('<img class="thumb" src="%s" alt="" loading="lazy" '
+                  'onerror="this.remove()">' % m.group(2)) if m else ""
+    src_html = ('<span class="srctag">%s</span>' % e(source)) if source else ""
+    parts.append('<summary class="top">%s<span class="caret">&#9656;</span>'
+                 '<span class="title">%s</span>%s%s</summary>'
+                 % (thumb_html, e(it.get("title", "")), src_html, date_html))
+    # Expandido: el resumen y el enlace al original.
+    parts.append('<div class="body">')
+    text = it.get("text", "")
+    if text:
+        # Ya viene saneado por sanitize_html: se inyecta tal cual.
+        parts.append('<div class="text">%s</div>' % text)
+    else:
+        parts.append('<p class="text">(sin resumen; abri el enlace para leer)</p>')
+    parts.append('<div class="acts">')
+    link = it.get("link", "")
+    if link:
+        parts.append('<a class="link" href="%s" target="_blank" rel="noopener">Abrir enlace original &#8599;</a>'
+                     % e(link))
+    if not static:
+        if not saved_mode:
+            label = "marcar no leido" if it.get("read") else "marcar leido"
+            parts.append('<a class="mark-read" onclick="toggleRead(this)">%s</a>' % label)
+        on = " on" if (is_saved or saved_mode) else ""
+        star = "Guardada &#9733;" if (is_saved or saved_mode) else "Guardar &#9734;"
+        tip = "Quitar de guardados" if (is_saved or saved_mode) else "Guardar la noticia"
+        parts.append('<a class="save%s" title="%s" onclick="toggleSave(this)">%s</a>' % (on, tip, star))
+    parts.append('</div>')   # acts
+    parts.append('</div>')   # body
+    parts.append('</details>')
+    return "".join(parts)
+
+
+def render_feed_html(feed, index=0, static=False, saved=frozenset()):
     items = feed.get("items", [])
     unread = sum(1 for it in items if not it.get("read"))
     parts = []
@@ -907,32 +1133,22 @@ def render_feed_html(feed, index=0, static=False):
     if not items:
         parts.append('<div class="empty">Sin items todavia.</div>')
     for it in items:
-        cls = "item read" if it.get("read") else "item"
-        parts.append('<details class="%s" data-id="%s">' % (cls, e(it.get("id", ""))))
-        # Colapsado: solo el titulo (y la fecha). Clic en el titulo -> expande.
-        date_html = date_el(it.get("date", 0))
-        parts.append('<summary class="top"><span class="caret">&#9656;</span>'
-                     '<span class="title">%s</span>%s</summary>'
-                     % (e(it.get("title", "")), date_html))
-        # Expandido: el resumen y el enlace al original.
-        parts.append('<div class="body">')
-        text = it.get("text", "")
-        if text:
-            # Ya viene saneado por sanitize_html: se inyecta tal cual.
-            parts.append('<div class="text">%s</div>' % text)
-        else:
-            parts.append('<p class="text">(sin resumen; abri el enlace para leer)</p>')
-        parts.append('<div class="acts">')
-        link = it.get("link", "")
-        if link:
-            parts.append('<a class="link" href="%s" target="_blank" rel="noopener">Abrir enlace original &#8599;</a>'
-                         % e(link))
-        if not static:
-            label = "marcar no leido" if it.get("read") else "marcar leido"
-            parts.append('<a class="mark-read" onclick="toggleRead(this)">%s</a>' % label)
-        parts.append('</div>')   # acts
-        parts.append('</div>')   # body
-        parts.append('</details>')
+        parts.append(_render_item(it, static=static, is_saved=it.get("id") in saved))
+    parts.append('</section>')
+    return "".join(parts)
+
+
+def render_saved_html(saved_items, static=False):
+    """Seccion virtual 'Guardados' (oculta salvo que se filtre desde la sidebar)."""
+    parts = ['<section class="feed" id="feed-saved" data-url="__saved__" style="display:none">']
+    parts.append('<h2><span>&#9733; Guardados</span>'
+                 '<span class="count">%d items</span><span class="spacer"></span></h2>'
+                 % len(saved_items))
+    if not saved_items:
+        parts.append('<div class="empty">Todavia no guardaste ninguna noticia. '
+                     'Us&aacute; &laquo;Guardar&raquo; en cualquier item.</div>')
+    for it in saved_items:
+        parts.append(_render_item(it, static=static, saved_mode=True, source=it.get("feed", "")))
     parts.append('</section>')
     return "".join(parts)
 
@@ -943,9 +1159,11 @@ def render_page(cache, static=False):
     unread = sum(1 for f in feeds for it in f.get("items", []) if not it.get("read"))
     saved = cache.get("saved", 0)
     saved_html = date_el(saved) if saved else "nunca"
+    saved_items = [] if static else load_saved().get("items", [])
+    saved_set = {it.get("id") for it in saved_items}
 
     html_parts = []
-    html_parts.append("<!doctype html><html lang='es' data-theme='dark'><head><meta charset='utf-8'>")
+    html_parts.append("<!doctype html><html lang='es' data-theme='dark' data-view='mosaic'><head><meta charset='utf-8'>")
     html_parts.append("<meta name='viewport' content='width=device-width,initial-scale=1'>")
     html_parts.append("<title>%s</title>" % APP_NAME)
     if not static:
@@ -953,9 +1171,8 @@ def render_page(cache, static=False):
     html_parts.append("<style>%s</style>" % PAGE_CSS)
     html_parts.append("</head><body>")
 
-    html_parts.append("<header><h1>Teno<span class='dot'>&bull;</span>RSS <span style='color:var(--muted);font-weight:400;font-size:13px'>Web</span></h1>")
-    html_parts.append("<span class='meta'>%d sin leer / %d items</span>" % (unread, total))
-    html_parts.append("<span class='spacer'></span>")
+    html_parts.append("<header><h1>Teno<span class='dot'>&bull;</span>RSS <span class='web'>Web</span></h1>")
+    html_parts.append("<span class='meta count'>%d sin leer / %d items</span>" % (unread, total))
     html_parts.append("<span class='meta'>actualizado: %s</span>" % saved_html)
     if not static:
         dirty = bool(cache.get("dirty"))
@@ -963,6 +1180,7 @@ def render_page(cache, static=False):
         btn_title = " title='Cambiaron las fuentes: actualiza para refrescar todo'" if dirty else ""
         html_parts.append("<form method='post' action='/refresh' style='margin:0'>"
                           "<button%s%s>Actualizar</button></form>" % (btn_cls, btn_title))
+        html_parts.append("<button id='viewBtn' title='Vista mosaico' onclick='toggleView()'>&#9638;</button>")
         html_parts.append("<button id='themeBtn' title='Cambiar tema' onclick='toggleTheme()'>&#9728;&#65039;</button>")
     html_parts.append("</header>")
 
@@ -978,6 +1196,8 @@ def render_page(cache, static=False):
     if not static:
         html_parts.append("<a class='src active' data-url='' href='#' onclick='filterSource(this);return false;'>"
                           "<span class='name'>Todas</span><span class='c'>%d</span></a>" % unread)
+        html_parts.append("<a class='src' data-url='__saved__' href='#feed-saved' onclick='filterSource(this);return false;'>"
+                          "<span class='name'>&#9733; Guardados</span><span class='c'>%d</span></a>" % len(saved_items))
     for i, feed in enumerate(feeds):
         fitems = feed.get("items", [])
         funread = sum(1 for it in fitems if not it.get("read"))
@@ -995,10 +1215,12 @@ def render_page(cache, static=False):
 
     # Contenido.
     html_parts.append("<main>")
+    if not static:
+        html_parts.append(render_saved_html(saved_items, static=static))
     if not feeds:
         html_parts.append("<div class='empty'>No hay fuentes. Agregalas en <code>rss.txt</code> y actualiza.</div>")
     for i, feed in enumerate(feeds):
-        html_parts.append(render_feed_html(feed, index=i, static=static))
+        html_parts.append(render_feed_html(feed, index=i, static=static, saved=saved_set))
     html_parts.append("</main>")
 
     html_parts.append("</div>")  # layout
@@ -1080,7 +1302,7 @@ def render_admin_page(saved_backup=None):
     p.append("</head><body>")
 
     p.append("<header><h1>Teno<span class='dot'>&bull;</span>RSS "
-             "<span style='color:var(--muted);font-weight:400;font-size:13px'>Fuentes</span></h1>")
+             "<span class='web'>Fuentes</span></h1>")
     p.append("<span class='spacer'></span>")
     p.append("<a class='btn' href='/'>&larr; Volver</a>")
     p.append("<button id='themeBtn' title='Cambiar tema' onclick='toggleTheme()'>&#9728;&#65039;</button>")
@@ -1225,6 +1447,11 @@ class Handler(BaseHTTPRequestHandler):
             url = (q.get("url") or [""])[0]
             read = (q.get("read") or ["1"])[0] == "1"
             ok = set_read_feed(url, read)
+            self._send("ok" if ok else "no", status=200 if ok else 404, ctype="text/plain")
+        elif parsed.path == "/api/save":
+            item_hash = (q.get("id") or [""])[0]
+            do_save = (q.get("save") or ["1"])[0] == "1"
+            ok = save_item(item_hash) if do_save else unsave_item(item_hash)
             self._send("ok" if ok else "no", status=200 if ok else 404, ctype="text/plain")
         else:
             self._send("404", status=404, ctype="text/plain")
