@@ -24,8 +24,10 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -44,10 +46,12 @@ MEDIA_DIR = os.path.join(HERE, "media")      # imagenes cacheadas para leer offl
 
 APP_NAME = "TenoRSSWeb"
 CACHE_VERSION = 1
+DEFAULT_CAT = "General"   # categoria de las fuentes sin CAT asignada
 MAX_ITEMS = 50            # items guardados por fuente
 TEXT_LIMIT = 3000         # maximo de texto visible por item (se recorta el resto)
 MAX_IMG_BYTES = 5 * 1024 * 1024  # imagenes mas grandes no se cachean (se dejan remotas)
 HTTP_TIMEOUT = 15         # segundos por descarga
+MAX_WORKERS = 8           # descargas en paralelo (feeds e imagenes)
 AUTO_UPDATE_MINUTES = 30  # cada cuanto refresca solo el servidor (0 = desactivado)
 USER_AGENT = "TenoRSSWeb/1.0 (+https://github.com/ ; RSS reader)"
 
@@ -68,7 +72,7 @@ def parse_rss_txt(text):
         if not line or line.startswith("#"):
             continue
         if line.startswith("[") and line.endswith("]"):
-            current = {"name": line[1:-1].strip(), "url": ""}
+            current = {"name": line[1:-1].strip(), "url": "", "cat": ""}
             feeds.append(current)
             continue
         key, sep, val = line.partition("=")
@@ -78,6 +82,8 @@ def parse_rss_txt(text):
         val = val.strip().strip('"').strip("'").strip()
         if key == "URL" and current is not None:
             current["url"] = val
+        elif key == "CAT" and current is not None:
+            current["cat"] = val
     return [f for f in feeds if f["url"]]
 
 
@@ -91,7 +97,7 @@ def load_config():
 def build_rss_txt(feeds):
     """Lista de {'name','url'} -> contenido de rss.txt (mismo formato)."""
     out = ["# TenoRSSWeb - fuentes RSS/Atom.\n",
-           "# Una seccion por feed: [Nombre] y URL=\"...\".\n",
+           "# Una seccion por feed: [Nombre], URL=\"...\" y CAT=\"...\" (opcional).\n",
            "# Editado desde la pagina de administracion (/fuentes).\n\n"]
     for f in feeds:
         name = (f.get("name") or f.get("url") or "").replace("[", "").replace("]", "")
@@ -99,8 +105,12 @@ def build_rss_txt(feeds):
         url = (f.get("url") or "").replace("\n", "").replace("\r", "").replace('"', "").strip()
         if not url:
             continue
+        cat = (f.get("cat") or "").replace("\n", " ").replace("\r", " ").replace('"', "").strip()
         out.append("[%s]\n" % name)
-        out.append('URL="%s"\n\n' % url)
+        out.append('URL="%s"\n' % url)
+        if cat:
+            out.append('CAT="%s"\n' % cat)
+        out.append("\n")
     return "".join(out).rstrip() + "\n"
 
 
@@ -142,9 +152,10 @@ def sync_cache_to_config():
             f = old.get(cfg["url"])
             if f:
                 f["name"] = cfg["name"]  # por si lo renombraron
+                f["cat"] = cfg.get("cat", "")  # por si le cambiaron la categoria
                 new.append(f)
             else:
-                new.append({"name": cfg["name"], "url": cfg["url"],
+                new.append({"name": cfg["name"], "url": cfg["url"], "cat": cfg.get("cat", ""),
                             "status": "sin actualizar", "updated": 0, "items": []})
         cache["feeds"] = new
         cache["dirty"] = True   # fuentes editadas: hay que actualizar
@@ -187,9 +198,10 @@ def dump_cache(cache):
         int(cache.get("saved", 0)), 1 if cache.get("dirty") else 0))
     feed_chunks = []
     for feed in cache.get("feeds", []):
-        head = '\n{"name":%s,"url":%s,"updated":%d,"status":%s,"items":[' % (
+        head = '\n{"name":%s,"url":%s,"cat":%s,"updated":%d,"status":%s,"items":[' % (
             json.dumps(feed.get("name", ""), ensure_ascii=False),
             json.dumps(feed.get("url", ""), ensure_ascii=False),
+            json.dumps(feed.get("cat", ""), ensure_ascii=False),
             int(feed.get("updated", 0)),
             json.dumps(feed.get("status", "ok"), ensure_ascii=False))
         item_lines = []
@@ -633,27 +645,41 @@ def _fetch_image(url):
         if not ext:
             return ""
         fname = h + ext
-        tmp = os.path.join(MEDIA_DIR, fname + ".tmp")
-        with open(tmp, "wb") as fh:
-            fh.write(data)
-        os.replace(tmp, os.path.join(MEDIA_DIR, fname))
+        # tmp unico por descarga: dos hilos pueden bajar imagenes a la vez.
+        fd, tmp = tempfile.mkstemp(prefix=h + "-", suffix=".tmp", dir=MEDIA_DIR)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, os.path.join(MEDIA_DIR, fname))
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return ""
         return "/media/" + fname
     except Exception:
         return ""
 
 
-def cache_images(html_str):
-    """Reescribe los <img src="http..."> a rutas locales, descargando lo que falte.
-    Si una imagen falla, deja la URL remota (online igual se ve)."""
+def _remote_images(html_str):
+    """URLs http(s) de los <img> de un fragmento (para bajarlas en lote)."""
+    urls = []
+    if html_str and "<img" in html_str:
+        for m in _IMG_SRC_RE.finditer(html_str):
+            if m.group(2).lower().startswith(("http://", "https://")):
+                urls.append(m.group(2))
+    return urls
+
+
+def _rewrite_images(html_str, url_map):
+    """Reescribe <img src="http..."> a su ruta local segun url_map (url -> /media/..).
+    Lo que no este en el mapa (fallo la descarga) queda con la URL remota."""
     if not html_str or "<img" not in html_str:
         return html_str
 
     def repl(m):
-        url = m.group(2)
-        low = url.lower()
-        if not (low.startswith("http://") or low.startswith("https://")):
-            return m.group(0)  # ya es local u otro esquema
-        local = _fetch_image(url)
+        local = url_map.get(m.group(2))
         return (m.group(1) + local + m.group(3)) if local else m.group(0)
 
     return _IMG_SRC_RE.sub(repl, html_str)
@@ -700,36 +726,71 @@ def merge_items(fresh, old):
     return merged[:MAX_ITEMS]
 
 
+def _fetch_one(cfg, old):
+    """Baja y parsea una fuente (sin cachear imagenes todavia). Devuelve el dict
+    del feed con sus items; las <img> siguen apuntando a las URLs remotas."""
+    name, url = cfg["name"], cfg["url"]
+    old_items = old.get("items", [])
+    try:
+        raw = fetch_feed(url)
+        fresh = parse_feed(raw)
+        items = merge_items(fresh, old_items)
+        status, updated = "ok", int(time.time())
+    except (URLError, HTTPError, ET.ParseError, ValueError) as exc:
+        items = old_items
+        status = "error: %s" % (exc.reason if hasattr(exc, "reason") else exc)
+        updated = old.get("updated", 0)
+    return {"name": name, "url": url, "cat": cfg.get("cat", ""),
+            "status": status, "updated": updated, "items": items}
+
+
 def update_all(verbose=True):
-    """Descarga todas las fuentes y reescribe cache.json. Devuelve el cache."""
+    """Descarga todas las fuentes y reescribe cache.json. Devuelve el cache.
+    Fase 1: baja y parsea los feeds en paralelo. Fase 2: baja en paralelo las
+    imagenes remotas (unicas) de todos los items y reescribe los <img> a /media/."""
     feeds_cfg = load_config()
     with _cache_lock:
         cache = load_cache()
         old_by_url = {f.get("url"): f for f in cache.get("feeds", [])}
+
+        # Fase 1: feeds en paralelo (tope de la suma -> ~el feed mas lento).
+        results = {}
+        if feeds_cfg:
+            with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(feeds_cfg))) as ex:
+                futs = {ex.submit(_fetch_one, cfg, old_by_url.get(cfg["url"], {})): cfg["url"]
+                        for cfg in feeds_cfg}
+                for fut in as_completed(futs):
+                    fd = fut.result()
+                    results[fd["url"]] = fd
+
+        # Fase 2: juntar las imagenes remotas unicas y bajarlas en paralelo.
+        remote = set()
+        for fd in results.values():
+            for it in fd["items"]:
+                remote.update(_remote_images(it.get("text", "")))
+        url_map = {}
+        if remote:
+            remote_urls = list(remote)   # orden fijo para emparejar con los resultados
+            with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(remote_urls))) as ex:
+                for url, local in zip(remote_urls, ex.map(_fetch_image, remote_urls)):
+                    if local:
+                        url_map[url] = local
+
+        # Reescribir <img> a rutas locales y reensamblar en el orden de rss.txt.
         new_feeds = []
         for cfg in feeds_cfg:
-            name, url = cfg["name"], cfg["url"]
-            old = old_by_url.get(url, {})
-            old_items = old.get("items", [])
-            try:
-                raw = fetch_feed(url)
-                fresh = parse_feed(raw)
-                items = merge_items(fresh, old_items)
-                status, updated = "ok", int(time.time())
-                if verbose:
-                    print("  [ok]  %-20s %d items" % (name, len(items)))
-            except (URLError, HTTPError, ET.ParseError, ValueError) as exc:
-                items = old_items
-                status = "error: %s" % (exc.reason if hasattr(exc, "reason") else exc)
-                updated = old.get("updated", 0)
-                if verbose:
-                    print("  [err] %-20s %s" % (name, status))
-            for it in items:  # cachea imagenes nuevas (las ya locales se saltean)
-                it["text"] = cache_images(it.get("text", ""))
-            new_feeds.append({
-                "name": name, "url": url, "status": status,
-                "updated": updated, "items": items,
-            })
+            fd = results.get(cfg["url"])
+            if fd is None:
+                continue
+            for it in fd["items"]:
+                it["text"] = _rewrite_images(it.get("text", ""), url_map)
+            new_feeds.append(fd)
+            if verbose:
+                if fd["status"] == "ok":
+                    print("  [ok]  %-20s %d items" % (fd["name"], len(fd["items"])))
+                else:
+                    print("  [err] %-20s %s" % (fd["name"], fd["status"]))
+
         cache["feeds"] = new_feeds
         cache["dirty"] = False  # recien actualizado
         prune_media(cache)      # borra imagenes que ya no usa ningun item
@@ -849,6 +910,23 @@ button.needs-refresh:hover{background:#d13b40;border-color:#d13b40}
 .sidebar a.src.active .c{background:var(--accent);color:#06240f}
 .sidebar a.src.off .c{opacity:.5}
 .sidebar a.src .doterr{color:#e06c75}
+/* Grupos de categoria en la barra lateral */
+.sidebar .cat-group{margin:0 0 4px}
+.sidebar .cat-head{display:flex;align-items:center;gap:4px;padding:4px 6px 2px 2px}
+.sidebar .cat-caret{background:none;border:none;color:var(--muted);padding:2px 4px;
+  font-size:11px;line-height:1;cursor:pointer;transition:transform .15s}
+.sidebar .cat-caret:hover{color:var(--accent);border-color:transparent}
+.sidebar .cat-group.collapsed .cat-caret{transform:rotate(-90deg)}
+.sidebar .cat-group.collapsed .cat-list{display:none}
+.sidebar a.cat-name{flex:1;font-size:12px;text-transform:uppercase;letter-spacing:.07em;
+  color:var(--muted);text-decoration:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sidebar .cat-head span.cat-name{flex:1;font-size:12px;text-transform:uppercase;
+  letter-spacing:.07em;color:var(--muted)}
+.sidebar a.cat-name:hover{color:var(--accent)}
+.sidebar a.cat-name.active{color:var(--accent);font-weight:600}
+.sidebar .cat-head .c{color:var(--muted);font-size:11px;background:var(--panel2);
+  border-radius:10px;padding:1px 7px;min-width:20px;text-align:center}
+.sidebar .cat-list a.src{margin-left:8px}
 
 main{flex:1;min-width:0;padding:16px}
 .feed{margin:0 0 22px}
@@ -931,6 +1009,9 @@ footer{color:var(--muted);text-align:center;font-size:12px;padding:24px}
   .sidebar{position:static;width:auto;max-height:none;flex:none;overflow:visible;
     padding:12px 16px 0;display:flex;flex-wrap:wrap;gap:6px}
   .sidebar .side-title{width:100%;margin:0 0 2px}
+  .sidebar .cat-group{width:100%;margin:0}
+  .sidebar .cat-list{display:flex;flex-wrap:wrap;gap:6px}
+  .sidebar .cat-list a.src{margin-left:0}
   .sidebar a.src{flex:0 0 auto;border:1px solid var(--line)}
   .sidebar a.src .name{max-width:45vw}
   main{padding:12px 16px 16px}
@@ -975,26 +1056,60 @@ function toggleView(){
   applyView(next); updateViewBtn();
 }
 
-// Filtro por fuente desde la barra lateral.
+// Filtro desde la barra lateral: por fuente puntual o por categoria entera.
+function clearActive(){
+  document.querySelectorAll('.sidebar a.src.active, .sidebar a.cat-name.active')
+    .forEach(a=>a.classList.remove('active'));
+}
+function showFeeds(keep){
+  document.querySelectorAll('main .feed').forEach(f=>{
+    f.style.display = keep(f) ? '' : 'none';
+  });
+}
 function filterSource(el){
   const url = el.dataset.url || '';
-  document.querySelectorAll('.sidebar a.src').forEach(a=>a.classList.toggle('active', a===el));
-  document.querySelectorAll('main .feed').forEach(f=>{
+  clearActive(); el.classList.add('active');
+  showFeeds(function(f){
     const isSaved = f.dataset.url==='__saved__';
-    let show;
-    if(url==='__saved__') show = isSaved;       // solo la seccion Guardados
-    else if(!url) show = !isSaved;              // "Todas" oculta Guardados
-    else show = (f.dataset.url===url);          // una fuente puntual
-    f.style.display = show ? '' : 'none';
+    if(url==='__saved__') return isSaved;       // solo la seccion Guardados
+    if(!url) return !isSaved;                    // "Todas" oculta Guardados
+    return f.dataset.url===url;                  // una fuente puntual
   });
   try{ localStorage.setItem('tenorss-src', url); }catch(e){}
   window.scrollTo(0,0);
 }
+function filterCategory(el){
+  const cat = el.dataset.cat || '';
+  clearActive(); el.classList.add('active');
+  showFeeds(function(f){ return f.dataset.url!=='__saved__' && f.dataset.cat===cat; });
+  try{ localStorage.setItem('tenorss-src', 'cat:'+cat); }catch(e){}
+  window.scrollTo(0,0);
+}
 function restoreSource(){
-  let url=''; try{ url = localStorage.getItem('tenorss-src')||''; }catch(e){}
-  if(!url) return;
-  const el = document.querySelector('.sidebar a.src[data-url="'+CSS.escape(url)+'"]');
+  let v=''; try{ v = localStorage.getItem('tenorss-src')||''; }catch(e){}
+  if(!v) return;
+  if(v.indexOf('cat:')===0){
+    const el = document.querySelector('.sidebar a.cat-name[data-cat="'+CSS.escape(v.slice(4))+'"]');
+    if(el) filterCategory(el);
+    return;
+  }
+  const el = document.querySelector('.sidebar a.src[data-url="'+CSS.escape(v)+'"]');
   if(el) filterSource(el);
+}
+// Plegar/desplegar una categoria; la eleccion se guarda por categoria.
+function toggleCat(btn){
+  const g = btn.closest('.cat-group');
+  g.classList.toggle('collapsed');
+  const cat = g.dataset.cat || '';
+  let col={}; try{ col=JSON.parse(localStorage.getItem('tenorss-cats')||'{}'); }catch(e){}
+  if(g.classList.contains('collapsed')) col[cat]=1; else delete col[cat];
+  try{ localStorage.setItem('tenorss-cats', JSON.stringify(col)); }catch(e){}
+}
+function restoreCats(){
+  let col={}; try{ col=JSON.parse(localStorage.getItem('tenorss-cats')||'{}'); }catch(e){}
+  document.querySelectorAll('.sidebar .cat-group').forEach(function(g){
+    if(col[g.dataset.cat||'']) g.classList.add('collapsed');
+  });
 }
 
 async function post(url){
@@ -1039,7 +1154,7 @@ async function toggleSave(el){
 }
 
 document.addEventListener('DOMContentLoaded', function(){
-  updateThemeBtn(); updateViewBtn(); restoreSource();
+  updateThemeBtn(); updateViewBtn(); restoreCats(); restoreSource();
 });
 """
 
@@ -1117,7 +1232,8 @@ def render_feed_html(feed, index=0, static=False, saved=frozenset()):
     items = feed.get("items", [])
     unread = sum(1 for it in items if not it.get("read"))
     parts = []
-    parts.append('<section class="feed" id="feed-%d" data-url="%s">' % (index, e(feed.get("url", ""))))
+    parts.append('<section class="feed" id="feed-%d" data-url="%s" data-cat="%s">'
+                 % (index, e(feed.get("url", "")), e(feed.get("cat") or DEFAULT_CAT)))
     head = ['<h2><span>%s</span>' % e(feed.get("name", ""))]
     head.append('<span class="count">%d items &middot; %d sin leer</span>' % (len(items), unread))
     status = feed.get("status", "ok")
@@ -1198,19 +1314,45 @@ def render_page(cache, static=False):
                           "<span class='name'>Todas</span><span class='c'>%d</span></a>" % unread)
         html_parts.append("<a class='src' data-url='__saved__' href='#feed-saved' onclick='filterSource(this);return false;'>"
                           "<span class='name'>&#9733; Guardados</span><span class='c'>%d</span></a>" % len(saved_items))
+    # Fuentes agrupadas por categoria, respetando el orden de rss.txt.
+    cats_order, by_cat = [], {}
     for i, feed in enumerate(feeds):
-        fitems = feed.get("items", [])
-        funread = sum(1 for it in fitems if not it.get("read"))
-        err = feed.get("status", "ok") not in ("ok", "", None)
-        off = "" if funread else " off"
-        dot = "<span class='doterr' title='error'>&#9679;</span> " if err else ""
+        cat = feed.get("cat") or DEFAULT_CAT
+        if cat not in by_cat:
+            by_cat[cat] = []
+            cats_order.append(cat)
+        by_cat[cat].append((i, feed))
+
+    for cat in cats_order:
+        group = by_cat[cat]
+        cat_unread = sum(1 for (_, fd) in group
+                         for it in fd.get("items", []) if not it.get("read"))
+        html_parts.append("<div class='cat-group' data-cat='%s'>" % e(cat))
         if static:
-            html_parts.append("<a class='src%s' href='#feed-%d'>%s<span class='name'>%s</span><span class='c'>%d</span></a>"
-                              % (off, i, dot, e(feed.get("name", "")), funread))
+            html_parts.append("<div class='cat-head'><span class='cat-name'>%s</span>"
+                              "<span class='c'>%d</span></div>" % (e(cat), cat_unread))
         else:
-            html_parts.append("<a class='src%s' data-url='%s' href='#feed-%d' onclick='filterSource(this);return false;'>"
-                              "%s<span class='name'>%s</span><span class='c'>%d</span></a>"
-                              % (off, e(feed.get("url", "")), i, dot, e(feed.get("name", "")), funread))
+            html_parts.append(
+                "<div class='cat-head'>"
+                "<button class='cat-caret' title='Plegar/desplegar' onclick='toggleCat(this)'>&#9662;</button>"
+                "<a class='cat-name' href='#' data-cat='%s' onclick='filterCategory(this);return false;'>%s</a>"
+                "<span class='c'>%d</span></div>" % (e(cat), e(cat), cat_unread))
+        html_parts.append("<div class='cat-list'>")
+        for i, feed in group:
+            fitems = feed.get("items", [])
+            funread = sum(1 for it in fitems if not it.get("read"))
+            err = feed.get("status", "ok") not in ("ok", "", None)
+            off = "" if funread else " off"
+            dot = "<span class='doterr' title='error'>&#9679;</span> " if err else ""
+            if static:
+                html_parts.append("<a class='src%s' href='#feed-%d'>%s<span class='name'>%s</span><span class='c'>%d</span></a>"
+                                  % (off, i, dot, e(feed.get("name", "")), funread))
+            else:
+                html_parts.append("<a class='src%s' data-url='%s' href='#feed-%d' onclick='filterSource(this);return false;'>"
+                                  "%s<span class='name'>%s</span><span class='c'>%d</span></a>"
+                                  % (off, e(feed.get("url", "")), i, dot, e(feed.get("name", "")), funread))
+        html_parts.append("</div>")   # cat-list
+        html_parts.append("</div>")   # cat-group
     html_parts.append("</aside>")
 
     # Contenido.
@@ -1239,7 +1381,7 @@ ADMIN_CSS = """
 .admin input{font:inherit;background:var(--panel);color:var(--fg);
   border:1px solid var(--line);border-radius:8px;padding:8px 10px}
 .admin input:focus{outline:none;border-color:var(--accent)}
-.admin .head-row,.admin .row{display:grid;grid-template-columns:1fr 2fr 40px;gap:8px;margin:6px 0}
+.admin .head-row,.admin .row{display:grid;grid-template-columns:1fr 1.7fr 1fr 40px;gap:8px;margin:6px 0}
 .admin .head-row{color:var(--muted);font-size:12px;text-transform:uppercase;
   letter-spacing:.06em;margin-bottom:2px;padding:0 2px}
 .admin .row input{width:100%}
@@ -1261,10 +1403,11 @@ ADMIN_CSS = """
   padding:10px 14px;margin:0 0 18px;font-size:14px}
 @media (max-width:560px){
   .admin .head-row,.admin .row{grid-template-columns:1fr 40px}
-  .admin .head-row span:nth-child(2){display:none}
+  .admin .head-row span:nth-child(2),.admin .head-row span:nth-child(3){display:none}
   .admin .row .r-name{grid-column:1/2}
   .admin .row .r-url{grid-column:1/2}
-  .admin .row .del{grid-row:1/3}
+  .admin .row .r-cat{grid-column:1/2}
+  .admin .row .del{grid-row:1/4}
 }
 """
 
@@ -1279,6 +1422,7 @@ function toggleTheme(){ var n=currentTheme()==='dark'?'light':'dark';
 function rowHTML(){
   return '<input class="r-name" name="name" placeholder="Nombre" value="">'
     + '<input class="r-url" name="url" placeholder="https://ejemplo.com/feed" value="">'
+    + '<input class="r-cat" name="cat" list="cats" placeholder="Categor\\u00eda" value="">'
     + '<button type="button" class="del" title="Borrar" onclick="delRow(this)">\\u2715</button>';
 }
 function addRow(){
@@ -1316,15 +1460,27 @@ def render_admin_page(saved_backup=None):
              "agreg&aacute; o borr&aacute; filas, y puls&aacute; <b>Guardar</b>. "
              "Antes de escribir se hace un backup del <code>rss.txt</code> anterior.</p>")
 
+    # Categorias ya usadas, para autocompletar el campo (datalist).
+    existing_cats = []
+    for f in feeds_cfg:
+        c = (f.get("cat") or "").strip()
+        if c and c not in existing_cats:
+            existing_cats.append(c)
+    datalist = "<datalist id='cats'>%s</datalist>" % "".join(
+        "<option value='%s'></option>" % e(c) for c in existing_cats)
+
     p.append("<form method='post' action='/fuentes/save'>")
-    p.append("<div class='head-row'><span>Nombre</span><span>URL del feed</span><span></span></div>")
+    p.append(datalist)
+    p.append("<div class='head-row'><span>Nombre</span><span>URL del feed</span>"
+             "<span>Categor&iacute;a</span><span></span></div>")
     p.append("<div id='rows'>")
     for f in feeds_cfg:
         p.append("<div class='row'>"
                  "<input class='r-name' name='name' placeholder='Nombre' value='%s'>"
                  "<input class='r-url' name='url' placeholder='https://ejemplo.com/feed' value='%s'>"
+                 "<input class='r-cat' name='cat' list='cats' placeholder='Categor&iacute;a' value='%s'>"
                  "<button type='button' class='del' title='Borrar' onclick='delRow(this)'>&#10005;</button>"
-                 "</div>" % (e(f.get("name", "")), e(f.get("url", ""))))
+                 "</div>" % (e(f.get("name", "")), e(f.get("url", "")), e(f.get("cat", ""))))
     p.append("</div>")
     p.append("<button type='button' class='add' onclick='addRow()'>+ Agregar fuente</button>")
 
@@ -1423,13 +1579,15 @@ class Handler(BaseHTTPRequestHandler):
             body = parse_qs(self._read_body(), keep_blank_values=True)
             names = body.get("name", [])
             urls = body.get("url", [])
+            cats = body.get("cat", [])
             feeds = []
             for i, url in enumerate(urls):
                 url = url.strip()
                 if not url:
                     continue
                 name = names[i].strip() if i < len(names) else ""
-                feeds.append({"name": name, "url": url})
+                cat = cats[i].strip() if i < len(cats) else ""
+                feeds.append({"name": name, "url": url, "cat": cat})
             try:
                 save_rss_txt(feeds)
                 sync_cache_to_config()  # refleja los cambios sin descargar

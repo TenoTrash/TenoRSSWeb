@@ -1,42 +1,51 @@
 # TenoRSSWeb - fuentes RSS/Atom.
-# Una seccion por feed: [Nombre] y URL="...".
+# Una seccion por feed: [Nombre], URL="..." y CAT="..." (opcional).
 # Editado desde la pagina de administracion (/fuentes).
 
 [Microsoft Admin Center Status]
 URL="https://status.cloud.microsoft/api/feed/mac"
+CAT="Status"
 
 [Hackaday]
 URL="https://hackaday.com/blog/feed/"
+CAT="Tecnología"
 
 [Meshtastic]
 URL="https://meshtastic.org/blog/rss.xml"
+CAT="Meshtastic"
 
 [Segu-Info]
 URL="https://blog.segu-info.com.ar/feeds/posts/default"
+CAT="Ciberseguridad"
 
 [BBC Mundo]
 URL="https://feeds.bbci.co.uk/mundo/rss.xml"
-
-[Hacker News]
-URL="https://news.ycombinator.com/rss"
+CAT="Noticias"
 
 [Espressif]
 URL="https://developer.espressif.com/blog/index.xml"
+CAT="Tecnología"
 
 [HelTec]
 URL="https://heltec.org/feed/"
+CAT="Tecnología"
 
 [Seeed Studio]
 URL="https://www.seeedstudio.com/blog/feed/"
+CAT="Tecnología"
 
 [Raspberry Pi]
 URL="https://www.raspberrypi.com/news/feed/"
+CAT="Tecnología"
 
 [Brodersen Dark News]
 URL="https://www.brodersendarknews.com/feed"
+CAT="Ciberseguridad"
 
 [CVE High/Critical]
 URL="https://cvefeed.io/rssfeed/severity/high.xml"
+CAT="Ciberseguridad"
 
 [Infobae]
 URL="https://www.infobae.com/arc/outboundfeeds/rss/"
+CAT="Noticias"
